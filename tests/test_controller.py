@@ -20,6 +20,7 @@ from controller import (  # noqa: E402
     compute_ceilings,
     compute_desired,
     distribute,
+    effective_deadband,
     fetch_inverters,
 )
 
@@ -192,6 +193,19 @@ def test_distribute_no_ceilings_arg_falls_back_to_per_max():
     limits = distribute(800.0, invs, per_max_w=600.0)
     assert sum(limits.values()) == 800.0
     assert all(v <= 600.0 for v in limits.values())
+
+
+def test_effective_deadband_normal_when_grid_below_threshold():
+    # Grid near target → tight deadband for precise control.
+    assert effective_deadband(grid_w=-30.0, threshold_w=400.0, base_w=5.0, saturated_w=50.0) == 5.0
+    assert effective_deadband(grid_w=200.0, threshold_w=400.0, base_w=5.0, saturated_w=50.0) == 5.0
+    assert effective_deadband(grid_w=400.0, threshold_w=400.0, base_w=5.0, saturated_w=50.0) == 5.0
+
+
+def test_effective_deadband_widens_in_saturated_import():
+    # Grid well above threshold → wider deadband to suppress write churn.
+    assert effective_deadband(grid_w=401.0, threshold_w=400.0, base_w=5.0, saturated_w=50.0) == 50.0
+    assert effective_deadband(grid_w=2000.0, threshold_w=400.0, base_w=5.0, saturated_w=50.0) == 50.0
 
 
 @pytest.mark.asyncio

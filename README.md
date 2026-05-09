@@ -55,7 +55,11 @@ Every loop tick (default 20 s, the time Hoymiles needs to respond):
    inverters, respecting each ceiling. Headroom freed by sun-limited
    inverters flows to productive ones, up to their 600 W cap.
 5. The new limit is pushed via `number.set_value` only when it differs from
-   last tick by more than the deadband (5 W).
+   the last *written* value by more than the deadband. The deadband widens
+   from `SET_VALUE_DEADBAND_W` (5 W) to `SATURATION_DEADBAND_W` (50 W) when
+   grid import exceeds `SATURATION_GRID_THRESHOLD_W` (400 W) — in that
+   regime the inverters are running flat-out and W-level precision has no
+   benefit, so we suppress the noise-driven write churn.
 
 ### Failure modes
 
@@ -86,7 +90,9 @@ All runtime tuning is via HA helpers; only static identity goes in env vars:
 | `METRICS_PORT` | `8080` | Prometheus exposition |
 | `STALE_AFTER_S` | `30` | Power-sensor reading age threshold |
 | `MAX_STEP_W` | `200` | Per-tick anti-oscillation cap |
-| `SET_VALUE_DEADBAND_W` | `5` | Skip `number.set_value` if change is below this |
+| `SET_VALUE_DEADBAND_W` | `5` | Skip `number.set_value` if change is below this (W) |
+| `SATURATION_GRID_THRESHOLD_W` | `400` | Above this grid import, widen the deadband |
+| `SATURATION_DEADBAND_W` | `50` | Wider deadband used when grid is saturated import |
 | `LOG_LEVEL` | `INFO` | Standard Python log level |
 
 Live HA helpers (created by the operator):
@@ -113,6 +119,8 @@ Live HA helpers (created by the operator):
 | `zec_inverter_power_watts{inverter}` | gauge | live per-inverter AC |
 | `zec_loop_iterations_total` | counter | tick count |
 | `zec_loop_errors_total{kind}` | counter | by error class |
+| `zec_writes_skipped_total{reason}` | counter | limit writes suppressed (e.g. by deadband) |
+| `zec_effective_deadband_watts` | gauge | active deadband for the current tick |
 | `zec_enabled` | gauge | 1 if kill switch is on |
 | `zec_dry_run` | gauge | 1 if `DRY_RUN=true` |
 | `zec_ha_request_seconds{op}` | histogram | HA REST timing |

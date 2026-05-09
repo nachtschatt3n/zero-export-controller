@@ -35,6 +35,8 @@ INVERTERS = os.environ.get("INVERTERS", "s1,s2,s3").split(",")
 
 MAX_STEP_W = float(os.environ.get("MAX_STEP_W", "200"))
 SET_VALUE_DEADBAND_W = float(os.environ.get("SET_VALUE_DEADBAND_W", "5"))
+SATURATION_GRID_THRESHOLD_W = float(os.environ.get("SATURATION_GRID_THRESHOLD_W", "400"))
+SATURATION_DEADBAND_W = float(os.environ.get("SATURATION_DEADBAND_W", "50"))
 STALE_AFTER_S = float(os.environ.get("STALE_AFTER_S", "30"))
 
 
@@ -59,6 +61,13 @@ m_enabled = Gauge("zec_enabled", "1 if controller is enabled by kill-switch help
 m_dry_run = Gauge("zec_dry_run", "1 if controller is in dry-run mode")
 m_request = Histogram(
     "zec_ha_request_seconds", "HA REST request duration (s)", ["op"]
+)
+m_deadband = Gauge(
+    "zec_effective_deadband_watts",
+    "Active write deadband for the current tick (wider when grid is in saturated import)",
+)
+m_writes_skipped = Counter(
+    "zec_writes_skipped_total", "Limit writes skipped due to deadband", ["reason"]
 )
 
 
@@ -232,6 +241,19 @@ def compute_desired(grid_w: float, pv_total_w: float, params: TuningParams) -> f
     return max(0.0, min(params.cap_w, pv_total_w + delta))
 
 
+def effective_deadband(
+    grid_w: float, threshold_w: float, base_w: float, saturated_w: float
+) -> float:
+    """Wider deadband when grid is in saturated import.
+
+    When the household is pulling more than `threshold_w` from the grid, the
+    inverters are running flat-out anyway — fine W-level tracking has no
+    benefit and just churns the OpenDTU command stream. Widening the deadband
+    in that regime keeps inverter limits stable and cuts ~10x of writes.
+    """
+    return saturated_w if grid_w > threshold_w else base_w
+
+
 async def fetch_tuning(ha: HAClient) -> TuningParams | None:
     helpers = {
         "target_w": "input_number.solar_target_grid_power",
@@ -334,10 +356,20 @@ async def loop_once(
             {k: round(v) for k, v in new_limits.items()},
         )
 
+    deadband = effective_deadband(
+        grid_state.numeric if grid_ok else tuning.target_w,
+        SATURATION_GRID_THRESHOLD_W,
+        SET_VALUE_DEADBAND_W,
+        SATURATION_DEADBAND_W,
+    )
+    m_deadband.set(deadband)
+
+    written: dict[str, float] = dict(last_limits)
     for name, limit in new_limits.items():
         m_limit.labels(inverter=name).set(limit)
         prev = last_limits.get(name, -1.0)
-        if abs(limit - prev) < SET_VALUE_DEADBAND_W:
+        if abs(limit - prev) < deadband:
+            m_writes_skipped.labels(reason="deadband").inc()
             continue
         if DRY_RUN:
             logging.info(
@@ -353,8 +385,9 @@ async def loop_once(
                     "value": round(limit),
                 },
             )
+        written[name] = limit
 
-    return new_limits, tuning.loop_period_s
+    return written, tuning.loop_period_s
 
 
 async def main():
