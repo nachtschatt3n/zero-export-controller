@@ -151,7 +151,7 @@ class InverterState:
 
 
 SHADE_MARGIN_W = 30.0       # actual must trail current limit by more than this to be "sun-limited"
-SHADE_HEADROOM_W = 50.0     # headroom granted above actual production for shaded inverter ceiling
+SHADE_HEADROOM_W = 100.0    # headroom granted above actual production for shaded inverter ceiling
 
 
 def compute_ceilings(

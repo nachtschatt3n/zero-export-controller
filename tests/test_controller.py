@@ -119,12 +119,13 @@ class _FakeHA:
 def test_compute_ceilings_first_loop_with_steady_production():
     # First loop after pod restart with sun up: prev_limit defaults to per_max_w.
     # An inverter already producing at ~per_max_w looks limit-bound and gets
-    # the full ceiling. At night (actual=0) the ceiling collapses to ~50W,
-    # which is harmless because there's no power to harvest.
+    # the full ceiling. At night (actual=0) the ceiling collapses to
+    # SHADE_HEADROOM_W (100W), which is harmless because there's no power to
+    # harvest.
     invs = _invs_p(("s2", 595.0, True), ("s3", 0.0, True), ("s1", 0.0, False))
-    ceilings = compute_ceilings(invs, per_max_w=600.0, last_limits={})
-    assert ceilings["s2"] == 600.0          # producing near per_max → full
-    assert ceilings["s3"] == 50.0           # actual=0 → tight cap (night-safe)
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits={})
+    assert ceilings["s2"] == 650.0          # producing near per_max → full
+    assert ceilings["s3"] == 100.0          # actual=0 → tight cap (night-safe)
     assert ceilings["s1"] == 0.0            # unreachable
 
 
@@ -133,44 +134,55 @@ def test_compute_ceilings_sun_limited_gets_tight_cap():
     # s3 producing only 100 W against a 400 W limit (sun-limited) → tight ceiling.
     invs = _invs_p(("s1", 0.0, False), ("s2", 395.0, True), ("s3", 100.0, True))
     last = {"s2": 400.0, "s3": 400.0}
-    ceilings = compute_ceilings(invs, per_max_w=600.0, last_limits=last)
-    assert ceilings["s2"] == 600.0          # limit-bound -> raise ceiling
-    assert ceilings["s3"] == 100.0 + 50.0   # sun-limited -> actual + headroom
-    assert ceilings["s1"] == 0.0            # unreachable
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits=last)
+    assert ceilings["s2"] == 650.0           # limit-bound -> raise ceiling
+    assert ceilings["s3"] == 100.0 + 100.0   # sun-limited -> actual + headroom
+    assert ceilings["s1"] == 0.0             # unreachable
 
 
 def test_compute_ceilings_recovery_when_actual_meets_limit():
-    # Yesterday s3 was shaded; we tightened limit to 150. Now sun is back and
-    # s3 is producing at the 150 W limit. It must look limit-bound so the
+    # Yesterday s3 was shaded; we tightened limit to 200. Now sun is back and
+    # s3 is producing at the 200 W limit. It must look limit-bound so the
     # next ceiling restores to per_max_w and harvest can grow.
-    invs = _invs_p(("s2", 600.0, True), ("s3", 145.0, True), ("s1", 0.0, False))
-    last = {"s2": 600.0, "s3": 150.0}
-    ceilings = compute_ceilings(invs, per_max_w=600.0, last_limits=last)
-    assert ceilings["s3"] == 600.0  # 145+30=175 not < 150 -> not sun-limited
+    invs = _invs_p(("s2", 600.0, True), ("s3", 195.0, True), ("s1", 0.0, False))
+    last = {"s2": 650.0, "s3": 200.0}
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits=last)
+    assert ceilings["s3"] == 650.0  # 195+30=225 not < 200 -> not sun-limited
+
+
+def test_compute_ceilings_clamps_to_per_max():
+    # Sun-limited inverter actual + SHADE_HEADROOM_W could exceed per_max_w
+    # in theory; the ceiling must never exceed the hardware cap.
+    invs = _invs_p(("s2", 580.0, True), ("s3", 0.0, False), ("s1", 0.0, False))
+    last = {"s2": 700.0}  # we previously requested above per_max_w (e.g. helper bumped down)
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits=last)
+    # 580+100=680 > 650 → clamped to 650
+    assert ceilings["s2"] == 650.0
 
 
 def test_distribute_east_west_partial_shade_redistributes_headroom():
-    # The headline scenario: s2 is east-facing in afternoon at 600 W cap, s3
-    # is west-facing producing only 100 W. With desired=800 we want s2 at 600
-    # (full hardware) and s3 at 150 (tight cap), summing to 750 W ≤ 800 cap.
-    # Naive equal-share would give {s2:400, s3:400} and we'd lose ~200 W.
-    invs = _invs_p(("s2", 595.0, True), ("s3", 100.0, True))
-    last = {"s2": 600.0, "s3": 600.0}
-    ceilings = compute_ceilings(invs, per_max_w=600.0, last_limits=last)
-    limits = distribute(800.0, invs, per_max_w=600.0, ceilings=ceilings)
-    assert limits["s2"] == 600.0       # productive inverter at hardware cap
-    assert limits["s3"] == 150.0       # shaded inverter capped near actual
-    assert sum(limits.values()) <= 800.0  # legal cap respected
+    # The headline scenario: s2 is east-facing in afternoon producing close to
+    # its 650 W cap, s3 is west-facing producing only 100 W. With desired=900
+    # we want s2 at 650 (full hardware) and s3 at 200 (tight cap), summing to
+    # 850 W ≤ 900 cap. Naive equal-share would give {s2:450, s3:450} and lose
+    # ~250 W of harvest.
+    invs = _invs_p(("s2", 645.0, True), ("s3", 100.0, True))
+    last = {"s2": 650.0, "s3": 650.0}
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits=last)
+    limits = distribute(900.0, invs, per_max_w=650.0, ceilings=ceilings)
+    assert limits["s2"] == 650.0       # productive inverter at hardware cap
+    assert limits["s3"] == 200.0       # shaded inverter capped near actual
+    assert sum(limits.values()) <= 900.0  # legal cap respected
 
 
 def test_distribute_redistributes_to_one_when_other_shaded_low_desired():
-    # Lower desired (e.g. 500 W). Shaded s3 takes its 150, leaving 350 to s2.
-    invs = _invs_p(("s2", 595.0, True), ("s3", 100.0, True))
-    last = {"s2": 600.0, "s3": 600.0}
-    ceilings = compute_ceilings(invs, per_max_w=600.0, last_limits=last)
-    limits = distribute(500.0, invs, per_max_w=600.0, ceilings=ceilings)
-    assert limits["s2"] == 350.0
-    assert limits["s3"] == 150.0
+    # Lower desired (e.g. 500 W). Shaded s3 takes its 200, leaving 300 to s2.
+    invs = _invs_p(("s2", 295.0, True), ("s3", 100.0, True))
+    last = {"s2": 300.0, "s3": 650.0}
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits=last)
+    limits = distribute(500.0, invs, per_max_w=650.0, ceilings=ceilings)
+    assert limits["s2"] == 300.0
+    assert limits["s3"] == 200.0
     assert sum(limits.values()) == 500.0
 
 
