@@ -155,7 +155,7 @@ class TuningParams:
 @dataclass
 class InverterState:
     name: str
-    power_w: float
+    power_w: float | None
     reachable: bool
 
 
@@ -187,6 +187,15 @@ def compute_ceilings(
             out[inv.name] = 0.0
             continue
         prev_limit = last_limits.get(inv.name, per_max_w)
+        if inv.power_w is None:
+            # OpenDTU's MQTT power feed brownouts roughly every 1-2 minutes
+            # while binary_sensor.*_reachable stays on. Treating those as
+            # power=0 falsely tripped the shade branch and crushed the limit
+            # to SHADE_HEADROOM_W, oscillating the inverter limits.
+            # With no fresh reading, we can't decide shaded vs limit-bound;
+            # hold the prev limit so the deadband suppresses any write.
+            out[inv.name] = prev_limit
+            continue
         if inv.power_w + SHADE_MARGIN_W < prev_limit:
             out[inv.name] = max(0.0, min(per_max_w, inv.power_w + SHADE_HEADROOM_W))
         else:
@@ -289,7 +298,10 @@ async def fetch_inverters(ha: HAClient, names: list[str]) -> list[InverterState]
     for name in names:
         power = states.get(f"sensor.{name}_power")
         reach = states.get(f"binary_sensor.{name}_reachable")
-        power_w = power.numeric if power and power.numeric is not None else 0.0
+        # power_w=None means the power sensor went unavailable this tick.
+        # Don't coerce to 0.0 — that masquerades as "really producing zero"
+        # and trips false shade detection in compute_ceilings.
+        power_w = power.numeric if power else None
         # binary_sensor.*_reachable only updates last_updated on transitions; a
         # stable-on sensor will look "stale" but is in fact authoritative. HA
         # surfaces lost contact as state="unavailable", which .is_on rejects.
@@ -315,7 +327,8 @@ async def loop_once(
     )
     inverters = await fetch_inverters(ha, INVERTERS)
     for inv in inverters:
-        m_pv_per.labels(inverter=inv.name).set(inv.power_w)
+        if inv.power_w is not None:
+            m_pv_per.labels(inverter=inv.name).set(inv.power_w)
 
     grid_ok = grid_state and grid_state.numeric is not None and not grid_state.is_stale
     pv_ok = pv_state and pv_state.numeric is not None and not pv_state.is_stale

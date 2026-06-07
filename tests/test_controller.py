@@ -151,6 +151,29 @@ def test_compute_ceilings_recovery_when_actual_meets_limit():
     assert ceilings["s3"] == 650.0  # 195+30=225 not < 200 -> not sun-limited
 
 
+def test_compute_ceilings_holds_prev_when_power_unavailable():
+    # Regression: OpenDTU's MQTT brownouts every 1-2 minutes left
+    # sensor.s2_power=unavailable while binary_sensor.s2_reachable stayed on.
+    # Old behavior coerced power_w to 0.0 → shade branch → ceiling crashed to
+    # SHADE_HEADROOM_W (100 W), oscillating the limit every tick.
+    # Fix: power_w=None must hold the prev limit so the deadband suppresses
+    # the write entirely.
+    invs = _invs_p(("s2", None, True), ("s3", 345.0, True), ("s1", 0.0, False))
+    last = {"s2": 360.0, "s3": 360.0}
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits=last)
+    assert ceilings["s2"] == 360.0   # held at prev — no shade decision possible
+    assert ceilings["s3"] == 650.0   # 345+30=375 not <360 -> limit-bound
+    assert ceilings["s1"] == 0.0
+
+
+def test_compute_ceilings_unavailable_with_no_prev_holds_per_max():
+    # First loop after pod restart with no last_limits and the power sensor
+    # already unavailable: hold the default (per_max_w) rather than 0.
+    invs = _invs_p(("s2", None, True),)
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits={})
+    assert ceilings["s2"] == 650.0   # last_limits.get default = per_max_w
+
+
 def test_compute_ceilings_clamps_to_per_max():
     # Sun-limited inverter actual + SHADE_HEADROOM_W could exceed per_max_w
     # in theory; the ceiling must never exceed the hardware cap.
@@ -231,3 +254,20 @@ async def test_fetch_inverters_reachable_ignores_binary_sensor_staleness():
     assert by_name["s2"].reachable is False  # explicitly off
     assert by_name["s3"].reachable is False  # unavailable
     assert by_name["s1"].power_w == 412.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_inverters_unavailable_power_is_none_not_zero():
+    # Regression: sensor.s_n_power=unavailable used to surface as power_w=0.0,
+    # which falsely tripped shade detection. It must surface as None so
+    # compute_ceilings can hold the prev limit.
+    fresh = datetime.now(timezone.utc)
+    fake = _FakeHA(
+        {
+            "sensor.s1_power": HAState(state="unavailable", last_updated=fresh),
+            "binary_sensor.s1_reachable": HAState(state="on", last_updated=fresh),
+        }
+    )
+    invs = await fetch_inverters(fake, ["s1"])
+    assert invs[0].power_w is None
+    assert invs[0].reachable is True
