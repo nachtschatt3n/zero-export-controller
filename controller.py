@@ -2,9 +2,10 @@
 """Zero-export controller for Hoymiles micro-inverters via OpenDTU + Tibber Pulse.
 
 Reads grid power and tuning helpers from Home Assistant via REST, computes
-per-inverter power limits using a slow-approximation P controller with a
-system-wide cap and burst-capable per-inverter ceiling, then writes the
-limits back through the HA OpenDTU integration's number entities.
+per-inverter power limits with a feed-forward consumption tracker (produce
+what the household consumes, up to a system-wide cap, with burst-capable
+per-inverter ceilings), then writes the limits back through the HA OpenDTU
+integration's number entities.
 """
 
 import asyncio
@@ -33,8 +34,7 @@ PV_TOTAL_SENSOR = os.environ.get(
 )
 INVERTERS = os.environ.get("INVERTERS", "s1,s2,s3").split(",")
 
-MAX_STEP_W = float(os.environ.get("MAX_STEP_W", "200"))
-SET_VALUE_DEADBAND_W = float(os.environ.get("SET_VALUE_DEADBAND_W", "5"))
+SET_VALUE_DEADBAND_W = float(os.environ.get("SET_VALUE_DEADBAND_W", "25"))
 SATURATION_GRID_THRESHOLD_W = float(os.environ.get("SATURATION_GRID_THRESHOLD_W", "400"))
 SATURATION_DEADBAND_W = float(os.environ.get("SATURATION_DEADBAND_W", "50"))
 STALE_AFTER_S = float(os.environ.get("STALE_AFTER_S", "30"))
@@ -44,6 +44,9 @@ m_grid = Gauge("zec_grid_power_watts", "Latest grid power reading (W); negative 
 m_pv_total = Gauge("zec_pv_total_watts", "Latest PV total AC power (W)")
 m_target = Gauge("zec_target_watts", "Active grid target setpoint (W)")
 m_desired = Gauge("zec_desired_total_watts", "Computed desired total inverter limit (W)")
+m_consumption = Gauge(
+    "zec_consumption_est_watts", "EMA-smoothed household consumption estimate (W)"
+)
 m_limit = Gauge(
     "zec_inverter_limit_watts", "Effective per-inverter limit (W)", ["inverter"]
 )
@@ -244,10 +247,36 @@ def distribute(
     return limits
 
 
-def compute_desired(grid_w: float, pv_total_w: float, params: TuningParams) -> float:
-    error = grid_w - params.target_w
-    delta = max(-MAX_STEP_W, min(MAX_STEP_W, error * params.slow_approx))
-    return max(0.0, min(params.cap_w, pv_total_w + delta))
+def compute_desired(
+    grid_w: float,
+    pv_total_w: float,
+    params: TuningParams,
+    prev_consumption_w: float | None = None,
+) -> tuple[float, float]:
+    """Feed-forward: produce what the household consumes, offset by target_w.
+
+    consumption = grid + pv is independent of where the limits currently sit,
+    so desired jumps straight to the right answer in one tick. The previous
+    incremental P-controller stepped from wherever it was, which meant a
+    ~20-minute ramp to release limits upward at low gain — harvest thrown
+    away on every cloud edge — and write churn near equilibrium.
+
+    slow_approx is reused as the EMA smoothing factor on consumption
+    (1.0 = no smoothing, ~0.3 = a few ticks of memory). Smoothing rejects
+    meter noise and short appliance spikes; structural consumption shifts
+    still land within a tick or two.
+
+    Returns (desired_w, consumption_ema_w); the caller threads the ema back
+    in on the next tick.
+    """
+    consumption = grid_w + pv_total_w
+    alpha = min(1.0, max(0.01, params.slow_approx))
+    if prev_consumption_w is None:
+        ema = consumption
+    else:
+        ema = alpha * consumption + (1 - alpha) * prev_consumption_w
+    desired = max(0.0, min(params.cap_w, ema - params.target_w))
+    return desired, ema
 
 
 def effective_deadband(
@@ -311,14 +340,14 @@ async def fetch_inverters(ha: HAClient, names: list[str]) -> list[InverterState]
 
 
 async def loop_once(
-    ha: HAClient, last_limits: dict[str, float]
-) -> tuple[dict[str, float], float]:
+    ha: HAClient, last_limits: dict[str, float], prev_consumption_w: float | None
+) -> tuple[dict[str, float], float, float | None]:
     m_iters.inc()
     HEARTBEAT_PATH.write_text(datetime.now(timezone.utc).isoformat())
 
     tuning = await fetch_tuning(ha)
     if not tuning:
-        return last_limits, 20.0
+        return last_limits, 20.0, prev_consumption_w
     m_target.set(tuning.target_w)
     m_enabled.set(1 if tuning.enabled else 0)
 
@@ -343,14 +372,16 @@ async def loop_once(
         # 800 W cap is then only as good as the inverter's persistent_limit
         # config (set out-of-band in OpenDTU).
         logging.info("kill switch off: skipping writes; last limits remain in effect")
-        return last_limits, tuning.loop_period_s
+        return last_limits, tuning.loop_period_s, prev_consumption_w
     ceilings = compute_ceilings(inverters, tuning.per_max_w, last_limits)
     for name, c in ceilings.items():
         m_ceiling.labels(inverter=name).set(c)
 
+    consumption_w = prev_consumption_w
     if not grid_ok or not pv_ok:
         # Sensors stale or missing: fail to a safe state that respects the
         # legal 800 W cap regardless of how many inverters are reachable.
+        # The consumption ema is NOT updated from bad data.
         logging.warning(
             "safe fallback: grid_ok=%s pv_ok=%s — distributing cap_w across reachable",
             grid_ok, pv_ok,
@@ -358,13 +389,17 @@ async def loop_once(
         new_limits = distribute(tuning.cap_w, inverters, tuning.per_max_w, ceilings)
         m_desired.set(tuning.cap_w)
     else:
-        desired = compute_desired(grid_state.numeric, pv_state.numeric, tuning)
+        desired, consumption_w = compute_desired(
+            grid_state.numeric, pv_state.numeric, tuning, prev_consumption_w
+        )
         m_desired.set(desired)
+        m_consumption.set(consumption_w)
 
         new_limits = distribute(desired, inverters, tuning.per_max_w, ceilings)
         logging.info(
-            "grid=%.0fW pv=%.0fW target=%.0fW desired=%.0fW ceilings=%s limits=%s",
-            grid_state.numeric, pv_state.numeric, tuning.target_w, desired,
+            "grid=%.0fW pv=%.0fW consumption=%.0fW target=%.0fW desired=%.0fW ceilings=%s limits=%s",
+            grid_state.numeric, pv_state.numeric, consumption_w, tuning.target_w,
+            desired,
             {k: round(v) for k, v in ceilings.items()},
             {k: round(v) for k, v in new_limits.items()},
         )
@@ -400,7 +435,7 @@ async def loop_once(
             )
         written[name] = limit
 
-    return written, tuning.loop_period_s
+    return written, tuning.loop_period_s, consumption_w
 
 
 async def main():
@@ -414,10 +449,13 @@ async def main():
 
     ha = HAClient(HA_BASE_URL, HA_TOKEN)
     last_limits: dict[str, float] = {}
+    consumption_w: float | None = None
     try:
         while True:
             try:
-                last_limits, sleep_s = await loop_once(ha, last_limits)
+                last_limits, sleep_s, consumption_w = await loop_once(
+                    ha, last_limits, consumption_w
+                )
             except Exception:
                 logging.exception("loop iteration failed")
                 m_errs.labels(kind="loop").inc()

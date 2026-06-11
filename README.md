@@ -36,13 +36,21 @@ Tibber Pulse / smart meter → HA (sensor.*_power)
                               S1 / S2 / S3 inverters
 ```
 
-Every loop tick (default 20 s, the time Hoymiles needs to respond):
+Every loop tick (default 30 s; Hoymiles needs ~18 s to respond, so periods
+below 20 s are unsupported):
 
 1. Read grid power, PV total, per-inverter power & reachability, plus the
    six tunable HA helpers.
-2. **Slow-approximation P-controller** computes the desired total output:
-   `desired = clamp(pv_total + slow_approx × (grid − target), 0, cap_w)`,
-   with a per-tick step clamp (default ±200 W) to avoid overshoot.
+2. **Feed-forward consumption tracker** computes the desired total output:
+   `consumption = ema(grid + pv_total)`, then
+   `desired = clamp(consumption − target, 0, cap_w)`.
+   Household consumption is independent of where the limits currently sit,
+   so desired lands on the right answer in one tick — when consumption
+   exceeds the cap (most of the day), desired pins at `cap_w` and the
+   inverters run at maximum with zero writes. `slow_approx` is the EMA
+   smoothing factor (1.0 = no smoothing; ~0.3 = a few ticks of memory),
+   which rejects meter noise without slowing structural shifts. A negative
+   `target` tolerates that much sustained feed-in.
 3. **`compute_ceilings()`** decides each inverter's water-fill ceiling for
    this tick:
    - if actual production trails the previous limit by more than `SHADE_MARGIN_W`
@@ -89,8 +97,7 @@ All runtime tuning is via HA helpers; only static identity goes in env vars:
 | `INVERTERS` | `s1,s2,s3` | Inverter name prefixes for `sensor.{name}_power` etc. |
 | `METRICS_PORT` | `8080` | Prometheus exposition |
 | `STALE_AFTER_S` | `30` | Power-sensor reading age threshold |
-| `MAX_STEP_W` | `200` | Per-tick anti-oscillation cap |
-| `SET_VALUE_DEADBAND_W` | `5` | Skip `number.set_value` if change is below this (W) |
+| `SET_VALUE_DEADBAND_W` | `25` | Skip `number.set_value` if change is below this (W) |
 | `SATURATION_GRID_THRESHOLD_W` | `400` | Above this grid import, widen the deadband |
 | `SATURATION_DEADBAND_W` | `50` | Wider deadband used when grid is saturated import |
 | `LOG_LEVEL` | `INFO` | Standard Python log level |
@@ -99,11 +106,11 @@ Live HA helpers (created by the operator):
 
 | Entity | Type | Default | Range | Purpose |
 |---|---|---|---|---|
-| `input_number.solar_target_grid_power` | W | −50 | −500…0 | Slight import target |
-| `input_number.solar_max_total_watts` | W | 800 | 0…800 | Bagatellgrenze |
-| `input_number.solar_per_inverter_max_watts` | W | 600 | 0…600 | Hardware ceiling |
-| `input_number.solar_loop_period_s` | s | 20 | 10…60 | Tick period |
-| `input_number.solar_slow_approx` | — | 0.20 | 0.05…0.5 | P-gain |
+| `input_number.solar_target_grid_power` | W | 0 | −500…0 | Grid setpoint; negative tolerates that much feed-in |
+| `input_number.solar_max_total_watts` | W | 800 | 0…900 | System cap |
+| `input_number.solar_per_inverter_max_watts` | W | 600 | 0…650 | Hardware ceiling |
+| `input_number.solar_loop_period_s` | s | 30 | 20…120 | Tick period (≥20 s; Hoymiles reaction time) |
+| `input_number.solar_slow_approx` | — | 0.30 | 0.05…1.0 | Consumption EMA smoothing factor |
 | `input_boolean.solar_zero_export_enabled` | bool | on | — | Kill switch |
 
 ## Metrics (`/metrics`)
@@ -114,6 +121,7 @@ Live HA helpers (created by the operator):
 | `zec_pv_total_watts` | gauge | OpenDTU summed AC |
 | `zec_target_watts` | gauge | active target setpoint |
 | `zec_desired_total_watts` | gauge | computed desired total |
+| `zec_consumption_est_watts` | gauge | EMA-smoothed household consumption estimate |
 | `zec_inverter_limit_watts{inverter}` | gauge | effective per-inverter limit |
 | `zec_inverter_ceiling_watts{inverter}` | gauge | water-fill ceiling for this tick |
 | `zec_inverter_power_watts{inverter}` | gauge | live per-inverter AC |

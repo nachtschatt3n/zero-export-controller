@@ -82,31 +82,62 @@ def test_distribute_zero_desired():
     assert all(v == 0.0 for v in out.values())
 
 
-def test_compute_desired_increases_when_importing():
-    # grid=200W (importing too much vs. -50 target), pv=300W
-    # error = 200 - (-50) = 250; delta = 250 * 0.2 = 50; desired = 300 + 50 = 350
-    assert compute_desired(200.0, 300.0, _params()) == 350.0
+# compute_desired is feed-forward since v0.4.0: desired tracks estimated
+# household consumption (grid + pv) instead of stepping incrementally from
+# the previous limit. slow_approx is reused as the EMA smoothing factor.
 
 
-def test_compute_desired_decreases_when_exporting():
-    # grid=-150W (exporting), pv=500W
-    # error = -150 - (-50) = -100; delta = -100 * 0.2 = -20; desired = 500 - 20 = 480
-    assert compute_desired(-150.0, 500.0, _params()) == 480.0
+def test_compute_desired_pins_at_cap_when_consumption_above_cap():
+    # Household pulling 2000W from grid + 300W from PV = 2300W consumption.
+    # Desired must jump straight to cap_w — not ramp toward it over many ticks.
+    desired, ema = compute_desired(2000.0, 300.0, _params(slow_approx=1.0))
+    assert desired == 800.0
+    assert ema == 2300.0
 
 
-def test_compute_desired_caps_at_cap_w():
-    # huge import scenario, would request more than cap_w
-    assert compute_desired(2000.0, 600.0, _params()) == 800.0
+def test_compute_desired_tracks_consumption_directly():
+    # consumption = 100 + 250 = 350W; target 0 → produce exactly consumption.
+    desired, _ = compute_desired(100.0, 250.0, _params(target_w=0.0, slow_approx=1.0))
+    assert desired == 350.0
+
+
+def test_compute_desired_negative_target_allows_feed_in():
+    # target_w=-100 means "tolerate up to 100W export": desired = consumption + 100.
+    desired, _ = compute_desired(0.0, 400.0, _params(target_w=-100.0, slow_approx=1.0))
+    assert desired == 500.0
+
+
+def test_compute_desired_single_step_down_on_consumption_drop():
+    # Consumption was 800W (ema seeded), now drops to 300W. With alpha=1 the
+    # desired lands at 300W in ONE tick — no multi-tick ramp-down.
+    desired, ema = compute_desired(
+        -200.0, 500.0, _params(target_w=0.0, slow_approx=1.0), prev_consumption_w=800.0
+    )
+    assert ema == 300.0
+    assert desired == 300.0
+
+
+def test_compute_desired_ema_smooths_consumption_spike():
+    # Steady 500W consumption, one tick spikes to 2000W (kettle / sensor blip).
+    # With alpha=0.3 the ema moves to 0.3*2000 + 0.7*500 = 950 — partial, not full.
+    desired, ema = compute_desired(
+        1700.0, 300.0, _params(target_w=0.0, slow_approx=0.3), prev_consumption_w=500.0
+    )
+    assert ema == pytest.approx(950.0)
+    assert desired == pytest.approx(800.0)  # still clamped to cap
+
+
+def test_compute_desired_first_call_seeds_ema_with_sample():
+    # No previous estimate: the first sample IS the estimate (no warm-up lag).
+    desired, ema = compute_desired(100.0, 200.0, _params(target_w=0.0, slow_approx=0.3))
+    assert ema == 300.0
+    assert desired == 300.0
 
 
 def test_compute_desired_floors_at_zero():
-    # huge export scenario, would request negative
-    assert compute_desired(-5000.0, 100.0, _params(slow_approx=0.5)) == 0.0
-
-
-def test_compute_desired_max_step_clamp():
-    # 5000 W error * 0.2 = 1000, clamped to MAX_STEP_W=200 -> desired = pv + 200
-    assert compute_desired(4950.0, 100.0, _params()) == 300.0
+    # Pathological: consumption estimate negative (meter glitch) → desired 0, not negative.
+    desired, _ = compute_desired(-500.0, 100.0, _params(target_w=0.0, slow_approx=1.0))
+    assert desired == 0.0
 
 
 class _FakeHA:

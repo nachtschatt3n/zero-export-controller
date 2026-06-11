@@ -50,7 +50,7 @@ it up.
   `compute_ceilings` explains the east/west rationale; that's the bar.
   Don't restate what the code says.
 - **Logging at INFO** is the operator-visible record of every tick. Format
-  is stable: `grid=…W pv=…W target=…W desired=…W ceilings={…} limits={…}`.
+  is stable: `grid=…W pv=…W consumption=…W target=…W desired=…W ceilings={…} limits={…}`.
   Anything we add must keep that line greppable.
 - **Metrics names are stable API.** `zec_*` is our prefix. If you rename
   one, expect alert rules in the cluster repo to break.
@@ -131,9 +131,9 @@ Examples:
 4. **Sensors stale ⇒ safe distribution, not free run.** Don't revert to
    "set everything to per_max_w" on stale sensors — that violates the cap
    when more than one inverter is reachable.
-5. **Hoymiles needs ~18 s to react.** `LOOP_PERIOD_S < 10` is unsupported by
-   the algorithm; the slow-approx assumes the inverter is converging
-   between ticks.
+5. **Hoymiles needs ~18 s to react.** Loop periods below 20 s are
+   unsupported; the controller assumes the inverter has converged on the
+   previous limit before the next tick's consumption estimate.
 6. **Reachability is HA-state-driven.** `binary_sensor.*_reachable` only
    updates `last_updated` on transitions; treat its `is_on` as authoritative
    regardless of age.
@@ -158,7 +158,7 @@ When adding a feature, prefer:
 
 | Task | First step |
 |---|---|
-| Tune control gain | edit `input_number.solar_slow_approx` in HA — no redeploy needed |
+| Tune consumption smoothing | edit `input_number.solar_slow_approx` in HA (EMA alpha) — no redeploy needed |
 | Add a metric | `Gauge(...)` near top of `controller.py`; set in `loop_once` |
 | Change algorithm | edit `compute_ceilings` / `distribute` / `compute_desired`; add a test that captures the *behavioural* change before changing the code |
 | Cut a release | `git tag vX.Y.Z -m '…' && git push origin vX.Y.Z` |
