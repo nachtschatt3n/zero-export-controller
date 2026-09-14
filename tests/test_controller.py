@@ -215,6 +215,58 @@ def test_compute_ceilings_clamps_to_per_max():
     assert ceilings["s2"] == 650.0
 
 
+def test_compute_ceilings_hysteresis_holds_ceiling_through_pv_wobble():
+    # Regression (2026-09): with all three inverters sun-limited under broken
+    # cloud, the ceiling was recomputed from instantaneous power every tick, so
+    # every PV wobble above the deadband became a limit write — ~319 writes/day
+    # against a v0.4.0 design goal of ~12. Production moving inside the
+    # hysteresis band must leave the ceiling untouched so the deadband can
+    # suppress the write entirely.
+    last = {"s2": 250.0}
+    for power in (150.0, 170.0, 130.0, 120.0, 160.0):
+        invs = _invs_p(("s2", power, True),)
+        ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits=last)
+        assert ceilings["s2"] == 250.0, f"ceiling moved on {power} W wobble"
+
+
+def test_compute_ceilings_hysteresis_releases_upward_via_limit_bound():
+    # The upward path needs no separate re-target: production climbing to
+    # within SHADE_MARGIN_W of the held ceiling trips the existing limit-bound
+    # branch, which restores the full per_max_w ceiling in one step. Holding
+    # below that point is safe because the inverter still has room to grow.
+    invs = _invs_p(("s2", 225.0, True),)   # headroom 250-225 = 25 <= SHADE_MARGIN_W
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits={"s2": 250.0})
+    assert ceilings["s2"] == 650.0
+
+
+def test_compute_ceilings_hysteresis_releases_when_production_collapses():
+    # A cloud bank drops production far below the held ceiling: once headroom
+    # exceeds the band the ceiling must follow it down, so the water-fill frees
+    # that allocation for a productive inverter.
+    invs = _invs_p(("s2", 100.0, True),)    # headroom 450-100 = 350 > 100+120
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits={"s2": 450.0})
+    assert ceilings["s2"] == 200.0          # 100 + SHADE_HEADROOM_W
+
+
+def test_compute_ceilings_hysteresis_never_exceeds_per_max():
+    # The held ceiling must be clamped to per_max_w even when the previous
+    # limit sat above it (e.g. the per-inverter helper was just lowered).
+    invs = _invs_p(("s2", 560.0, True),)    # held 650, headroom 90 -> re-target
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits={"s2": 900.0})
+    assert ceilings["s2"] == 650.0
+
+
+def test_compute_ceilings_hysteresis_preserves_cap_invariant():
+    # Holding a stale (higher) ceiling must never let the distributed sum
+    # exceed the legal cap — distribute() is still bounded by `desired`.
+    invs = _invs_p(("s1", 150.0, True), ("s2", 160.0, True), ("s3", 140.0, True))
+    last = {"s1": 260.0, "s2": 270.0, "s3": 250.0}
+    ceilings = compute_ceilings(invs, per_max_w=650.0, last_limits=last)
+    assert ceilings == last                  # all inside the band -> all held
+    limits = distribute(900.0, invs, per_max_w=650.0, ceilings=ceilings)
+    assert sum(limits.values()) <= 900.0
+
+
 def test_distribute_east_west_partial_shade_redistributes_headroom():
     # The headline scenario: s2 is east-facing in afternoon producing close to
     # its 650 W cap, s3 is west-facing producing only 100 W. With desired=900

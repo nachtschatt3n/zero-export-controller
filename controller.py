@@ -164,6 +164,7 @@ class InverterState:
 
 SHADE_MARGIN_W = 30.0       # actual must trail current limit by more than this to be "sun-limited"
 SHADE_HEADROOM_W = 100.0    # headroom granted above actual production for shaded inverter ceiling
+SHADE_HYSTERESIS_W = 120.0  # extra headroom tolerated before the ceiling is rewritten
 
 
 def compute_ceilings(
@@ -200,7 +201,17 @@ def compute_ceilings(
             out[inv.name] = prev_limit
             continue
         if inv.power_w + SHADE_MARGIN_W < prev_limit:
-            out[inv.name] = max(0.0, min(per_max_w, inv.power_w + SHADE_HEADROOM_W))
+            # Tracking instantaneous power here made every PV wobble a limit
+            # write once all three inverters were sun-limited under broken
+            # cloud. Hold the existing ceiling while its headroom is still
+            # adequate; only re-target when production has eaten into the
+            # headroom or fallen far enough that the allocation is wasted.
+            held = min(prev_limit, per_max_w)
+            headroom = held - inv.power_w
+            if SHADE_MARGIN_W < headroom <= SHADE_HEADROOM_W + SHADE_HYSTERESIS_W:
+                out[inv.name] = held
+            else:
+                out[inv.name] = max(0.0, min(per_max_w, inv.power_w + SHADE_HEADROOM_W))
         else:
             out[inv.name] = per_max_w
     return out

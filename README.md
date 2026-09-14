@@ -54,11 +54,36 @@ below 20 s are unsupported):
 3. **`compute_ceilings()`** decides each inverter's water-fill ceiling for
    this tick:
    - if actual production trails the previous limit by more than `SHADE_MARGIN_W`
-     (30 W), the inverter is **sun-limited** → ceiling tightens to
-     `actual + SHADE_HEADROOM_W` (50 W).
-   - otherwise the ceiling is the full hardware `per_max_w` (600 W).
+     (30 W), the inverter is **sun-limited** → ceiling targets
+     `actual + SHADE_HEADROOM_W` (100 W).
+   - otherwise the ceiling is the full hardware `per_max_w` (650 W).
    Recovery is automatic: as soon as `actual ≈ limit`, the inverter looks
    limit-bound on the next tick and the ceiling is restored to `per_max_w`.
+
+   The sun-limited ceiling is **sticky**: while its headroom is still between
+   `SHADE_MARGIN_W` and `SHADE_HEADROOM_W + SHADE_HYSTERESIS_W` (120 W) the
+   previous ceiling is held unchanged. Without this, the ceiling tracked
+   instantaneous production and every PV wobble under broken cloud became a
+   limit write — measured at ~320 writes/day across three sun-limited
+   inverters in September 2026, against a v0.4.0 design goal of ~12. Holding
+   costs nothing while the inverter still has room to grow, and the upward
+   path needs no special case: production climbing to within `SHADE_MARGIN_W`
+   trips the limit-bound branch and restores the full ceiling in one step.
+
+   `SHADE_HYSTERESIS_W` trades write churn against harvest. A held ceiling
+   keeps allocation a shaded inverter cannot use, so the water-fill has less
+   headroom to hand a productive sibling — past ~140 W that starts throttling
+   real production. Replayed against 10 days of September 2026 history:
+
+   | `SHADE_HYSTERESIS_W` | writes/day | ticks throttled |
+   |---|---|---|
+   | (no hysteresis) | 319 | 10 |
+   | 120 (current) | 115 | 24 |
+   | 160 | 73 | 468 |
+   | 200 | 3 | 2152 |
+
+   120 W sits at the knee: most of the churn removed while throttling stays
+   at the no-hysteresis baseline. Re-measure before raising it.
 4. **`distribute()`** water-fills the desired total across reachable
    inverters, respecting each ceiling. Headroom freed by sun-limited
    inverters flows to productive ones, up to their 600 W cap.
