@@ -27,7 +27,8 @@ repo directly — open a PR in the cluster repo to bump the `image.tag`.
 ├── Dockerfile               python:3.12-slim, runs as UID 10001
 ├── .github/workflows/
 │   ├── ci.yml               pytest on push/PR
-│   └── container.yml        multi-arch image build to ghcr.io/<repo>
+│   ├── container.yml        multi-arch image build to ghcr.io/<repo>
+│   └── scheduled-rebuild.yml weekly no-cache rebuild of the latest release
 ├── README.md                user-facing docs
 ├── AGENTS.md                this file
 └── LICENSE                  MIT
@@ -74,6 +75,12 @@ defaults, single-pass.
   - `:main` — moving tip of main
   - `:sha-<short>` — exact commit
   - `:0.1.0`, `:0.1` — on `v0.1.0` semver tags
+
+- **`scheduled-rebuild.yml`** (Mondays 06:00 UTC + manual dispatch) rebuilds
+  the newest `v*` release with a fresh base and no cache, after running that
+  release's tests, and publishes `:<version>-b<YYYYMMDD>` (+ `:weekly`). It
+  never overwrites the pinned `:<version>` tag; deploy a rebuild by bumping
+  `image.tag` in the cluster repo.
 
 A docs-only commit on `main` will rebuild the image with a new `sha-*` tag,
 which is wasteful but harmless. Add `[skip ci]` to the commit message to skip
