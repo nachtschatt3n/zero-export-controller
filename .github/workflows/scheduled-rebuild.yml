@@ -11,7 +11,7 @@ name: Scheduled Rebuild
 
 on:
   schedule:
-    - cron: "0 6 * * 1"
+    - cron: "0 5 * * 1"
   workflow_dispatch:
     inputs:
       release_tag:
@@ -21,6 +21,7 @@ on:
 permissions:
   contents: read
   packages: write
+  actions: write   # keepalive step re-enables this workflow
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -81,3 +82,11 @@ jobs:
 
       - name: Show published digest
         run: docker buildx imagetools inspect "$IMAGE:${{ steps.rel.outputs.version }}-b${{ steps.rel.outputs.build }}"
+
+      # GitHub disables scheduled workflows after 60 days without repo
+      # activity (ai-sre/solarfocus-scraper schedules died that way in July).
+      # Re-enabling on every run resets the timer.
+      - name: Keepalive (re-enable this workflow)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/scheduled-rebuild.yml/enable"
